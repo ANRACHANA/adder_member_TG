@@ -94,16 +94,114 @@ while(process.env[`TG_ACCOUNT_${i}_PHONE`]){
 
 // ===== Telegram Client =====
 async function getClient(account){
-  if(clients[account.id]) return clients[account.id]
-  const client=new TelegramClient(
+
+  // ===== 1. CLEAN DEAD CLIENT =====
+  if(clients[account.id]){
+    try{
+      if(!clients[account.id].connected){
+        console.log(`🔄 Reconnecting cached ${account.phone}`)
+        await clients[account.id].connect()
+      }
+
+      await clients[account.id].getMe()
+      return clients[account.id] // ✅ still valid
+
+    }catch(err){
+      console.log(`♻️ Removing dead client ${account.phone}`)
+      delete clients[account.id]
+    }
+  }
+
+  // ===== 2. CREATE NEW CLIENT =====
+  const client = new TelegramClient(
     new StringSession(account.session),
     account.api_id,
     account.api_hash,
-    {connectionRetries:5}
+    {
+      connectionRetries: 5,
+      autoReconnect: true
+    }
   )
-  await client.connect()
-  clients[account.id]=client
-  return client
+
+  try{
+    // ===== 3. CONNECT =====
+    await client.connect()
+
+    // ===== 4. VERIFY SESSION =====
+    await client.getMe()
+
+    // ===== 5. AUTO RECONNECT GUARD =====
+    client.addEventHandler(async () => {
+      try{
+        if(!client.connected){
+          console.log(`🔄 Auto reconnect ${account.phone}`)
+          await client.connect()
+        }
+      }catch(e){
+        console.log(`⚠️ Reconnect failed ${account.phone}`)
+      }
+    })
+
+    // ===== 6. SAVE SESSION (AUTO UPDATE) =====
+    const newSession = client.session.save()
+
+    if(newSession !== account.session){
+      account.session = newSession
+
+      await update(ref(db,`accounts/${account.id}`),{
+        session: newSession
+      })
+
+      console.log(`🔄 Session updated ${account.phone}`)
+    }
+
+    // ===== 7. MARK ACTIVE =====
+    account.status = "active"
+    account.lastChecked = Date.now()
+
+    await update(ref(db,`accounts/${account.id}`),{
+      status:"active",
+      lastChecked:account.lastChecked,
+      floodWaitUntil:null
+    })
+
+    // ===== 8. SAVE CLIENT =====
+    clients[account.id] = client
+
+    return client
+
+  }catch(err){
+
+    console.log(`❌ Client init failed ${account.phone}:`, err.message)
+
+    // ===== 9. HANDLE FLOODWAIT =====
+    const wait = parseFlood(err)
+
+    if(wait){
+      const until = Date.now() + wait * 1000
+
+      account.status = "floodwait"
+      account.floodWaitUntil = until
+
+      await update(ref(db,`accounts/${account.id}`),{
+        status:"floodwait",
+        floodWaitUntil: until,
+        error: err.message
+      })
+
+    }else{
+      // ===== 10. SESSION INVALID =====
+      account.status = "error"
+
+      await update(ref(db,`accounts/${account.id}`),{
+        status:"error",
+        error: err.message,
+        lastChecked: Date.now()
+      })
+    }
+
+    return null
+  }
 }
 
 // ===== Flood Parse =====
@@ -118,13 +216,18 @@ function parseFlood(err){
 
 // ===== Refresh Account =====
 async function refreshAccountStatus(account){
-  if(account.floodWaitUntil && account.floodWaitUntil < Date.now()){
-    account.floodWaitUntil=null
-    account.status="active"
+  const now = Date.now()
+
+  if(account.floodWaitUntil && account.floodWaitUntil < now){
+    account.floodWaitUntil = null
+    account.status = "active"
+
     await update(ref(db,`accounts/${account.id}`),{
       status:"active",
       floodWaitUntil:null
     })
+
+    console.log(`✅ ${account.phone} back to active`)
   }
 }
 
@@ -178,12 +281,26 @@ setInterval(autoCheck,60000)
 autoCheck()
 
 // ===== Get Available Account =====
+let accIndex = 0
+
 function getAvailableAccount(){
-  const now=Date.now()
-  return accounts.find(a =>
-    a.status==="active" &&
-    (!a.floodWaitUntil || a.floodWaitUntil<now)
-  )
+  const now = Date.now()
+
+  for(let i=0; i<accounts.length; i++){
+    let idx = (accIndex + i) % accounts.length
+    let acc = accounts[idx]
+
+    if(
+      acc.status === "active" &&
+      acc.status !== "error" &&
+      (!acc.floodWaitUntil || acc.floodWaitUntil < now)
+    ){
+      accIndex = idx + 1 // 🔥 switch next account
+      return acc
+    }
+  }
+
+  return null // ❌ no account available
 }
 
 // ===== Auto Join =====
@@ -377,7 +494,14 @@ app.get('/history', async(req,res)=>{
   const snap=await get(ref(db,'history'))
   res.json(snap.val()||{})
 })
-
+// ===== Admin Login =====
+app.post('/api/login', (req,res)=>{
+  const { username, password } = req.body
+  if(username === process.env.ADMIN_USERNAME && password === process.env.ADMIN_PASSWORD){
+    return res.json({ success:true })
+  }
+  res.status(401).json({ success:false, error:"Invalid credentials" })
+})
 // ===== Frontend =====
 const __filename=fileURLToPath(import.meta.url)
 const __dirname=path.dirname(__filename)
